@@ -6,13 +6,16 @@ import time
 import contextlib
 import urllib.request
 import json as _json
+import sqlite3
+import os
+from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon import functions, types
 from telethon.errors import RPCError, UserAdminInvalidError, ChatAdminRequiredError, UserNotParticipantError
 
 API_ID = 0  # 替换为你的 Telegram API ID（从 https://my.telegram.org 获取）
 API_HASH = "your_api_hash_here"  # 替换为你的 API Hash
-SESSION = "/opt/tg-auto-heart/tg_hub"  # Session 文件路径，可自定义
+SESSION = "/opt/tg-auto-heart/tg_hub"
 TARGET_CHAT_ID = -100XXXXXXXXXX  # 替换为你的目标群组 ID（负数）
 
 CONTROL_USER_IDS = {123456789}  # 替换为允许操作机器人的管理员 Telegram 用户 ID
@@ -24,14 +27,21 @@ PRAISE_TRIGGER_TEXTS = {"真棒"}
 STATUS_TRIGGER_TEXTS = {"状态"}
 
 DELETE_DELAY_SECONDS = 30
-SUMMARY_DELETE_SECONDS = 60
+SUMMARY_DELETE_SECONDS = 180
 AI_API_BASE = "https://your-ai-api-endpoint/anthropic"  # 替换为你的 AI API 地址
 AI_API_KEY  = "your_ai_api_key_here"  # 替换为你的 AI API Key
 AI_MODEL    = "claude-3-5-haiku-20241022"
+AD_AI_MODEL = "MiniMax-M2.7"
 SUMMARY_PATTERN = re.compile(r"^总结最近\s*(\d+)\s*条$")
 MIN_TEMP_MUTE_SECONDS = 30
 MAX_TEMP_MUTE_SECONDS = 366 * 24 * 3600
 ADMIN_LOG_FALLBACK_LIMIT = 100
+
+# ── 广告检测配置 ──
+AD_CHECK_THRESHOLD = 10          # 7天发言≤此数的用户才做AI审查
+AD_VERIFY_TIMEOUT  = 90          # 验证答题超时秒数
+AD_DB_PATH = "/opt/tg-auto-heart/msg_stats.db"
+AD_CHECK_ENABLED   = False       # 广告检测总开关
 
 MUTE_FOREVER_PATTERN = re.compile(r"^禁言\s*(永久|永久禁言)$")
 MUTE_PATTERN = re.compile(r"^禁言\s*(\d+)\s*(秒钟|秒|分钟|分|小时|时|天)$")
@@ -41,6 +51,328 @@ UNIT_SECONDS = {"秒钟": 1, "秒": 1, "分钟": 60, "分": 60, "小时": 3600, 
 
 logging.basicConfig(level=logging.ERROR, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("tg-auto-heart")
+
+# ══════════════════════════════════════════════════
+#  广告检测模块：发言统计 + AI审查 + 答题验证
+# ══════════════════════════════════════════════════
+
+def _init_stats_db():
+    """初始化 SQLite 发言统计数据库"""
+    conn = sqlite3.connect(AD_DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS msg_count (
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, day)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mc_day ON msg_count(day)")
+    conn.commit()
+    conn.close()
+
+_init_stats_db()
+
+def record_message(user_id: int):
+    """记录一条发言（同步，轻量操作）"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(AD_DB_PATH)
+    conn.execute(
+        "INSERT INTO msg_count(user_id, day, count) VALUES(?,?,1) "
+        "ON CONFLICT(user_id, day) DO UPDATE SET count=count+1",
+        (user_id, today)
+    )
+    conn.commit()
+    conn.close()
+
+def get_7day_count(user_id: int) -> int:
+    """查询某用户近7天发言总数"""
+    cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    conn = sqlite3.connect(AD_DB_PATH)
+    row = conn.execute(
+        "SELECT COALESCE(SUM(count),0) FROM msg_count WHERE user_id=? AND day>=?",
+        (user_id, cutoff)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def build_low_activity_set() -> set:
+    """构建低活跃用户集合（7天发言≤阈值）"""
+    cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    conn = sqlite3.connect(AD_DB_PATH)
+    rows = conn.execute(
+        "SELECT user_id, SUM(count) as total FROM msg_count "
+        "WHERE day>=? GROUP BY user_id HAVING total<=?",
+        (cutoff, AD_CHECK_THRESHOLD)
+    ).fetchall()
+    conn.close()
+    return {r[0] for r in rows}
+
+def cleanup_old_stats():
+    """清理30天前的旧数据"""
+    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    conn = sqlite3.connect(AD_DB_PATH)
+    conn.execute("DELETE FROM msg_count WHERE day<?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+# 低活跃用户名单缓存
+_low_activity_users: set = set()
+_low_activity_updated: float = 0
+_boot_time: float = time.time()
+AD_WARMUP_SECONDS = 3600  # 启动后1小时内只记录不检测，等积累数据
+
+def is_low_activity(user_id: int) -> bool:
+    """判断用户是否为低活跃（使用缓存，每小时刷新一次）"""
+    global _low_activity_users, _low_activity_updated
+    now = time.time()
+    if now - _low_activity_updated > 3600:  # 每小时刷新
+        _low_activity_users = build_low_activity_set()
+        _low_activity_updated = now
+        logger.error("low_activity_cache_refreshed count=%d", len(_low_activity_users))
+    # 不在数据库中的用户（从未记录过发言）也视为低活跃
+    if user_id in _low_activity_users:
+        return True
+    # 如果用户不在缓存里，实时查一次（可能是缓存刷新后新来的）
+    count = get_7day_count(user_id)
+    return count <= AD_CHECK_THRESHOLD
+
+def ai_check_ad(text: str) -> bool:
+    """调用 AI 判断消息是否为广告，返回 True=广告"""
+    if not text or len(text.strip()) < 4:
+        return False
+    prompt = (
+        "你是一个Telegram群组的广告检测助手。请判断以下消息是否为广告、推广、引流、拉人、卖货、"
+        "代理招募、赌博、色情推广等垃圾信息。\n"
+        "只回复一个字：是 或 否\n"
+        "不要解释，不要多说任何内容。\n\n"
+        "消息内容：\n" + text[:1000]
+    )
+    payload = _json.dumps({
+        "model": AD_AI_MODEL,
+        "max_tokens": 500,
+        "messages": [{"role": "user", "content": prompt}]
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        AI_API_BASE + "/v1/messages",
+        data=payload,
+        headers={
+            "x-api-key": AI_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = _json.loads(resp.read().decode("utf-8"))
+        text_blocks = [b["text"] for b in result.get("content", []) if b.get("type") == "text"]
+        answer = "".join(text_blocks).strip()
+        logger.error("ad_check result=%r for text=%r", answer, text[:80])
+        return "是" in answer
+    except Exception:
+        logger.exception("ad_check_api_error")
+        return False  # API 异常时不误杀
+
+def generate_quiz() -> tuple:
+    """生成一道100以内加减法题目，返回 (题目文本, 正确答案int)"""
+    op = random.choice(["+", "-"])
+    if op == "+":
+        a = random.randint(1, 90)
+        b = random.randint(1, 99 - a)
+    else:
+        a = random.randint(10, 99)
+        b = random.randint(1, a)
+    answer = a + b if op == "+" else a - b
+    question = f"{a} {op} {b} = ?"
+    return question, answer
+
+# 正在验证中的用户 {user_id: {quiz_msg_id, ad_msg_id, answer, expire_time, task}}
+_pending_verifications: dict = {}
+
+async def start_ad_verification(client, msg):
+    """对疑似广告消息发起答题验证"""
+    user_id = msg.sender_id
+    # 如果该用户已经在验证中，跳过
+    if user_id in _pending_verifications:
+        return
+    try:
+        user = await msg.get_sender()
+    except Exception:
+        user = None
+    target_name = display_name_from_user(user)
+    question, answer = generate_quiz()
+    verify_text = (
+        f"⚠️ {target_name} 你的消息疑似广告，请在 90 秒内回复本消息回答以下问题：\n\n"
+        f"**{question}**\n\n"
+        f"回复正确数字即可解除嫌疑，回答错误或超时将被踢出群组。"
+    )
+    try:
+        sent = await client.send_message(
+            entity=TARGET_CHAT_ID,
+            message=verify_text,
+            reply_to=msg.id
+        )
+    except Exception:
+        logger.exception("send_verification_error")
+        return
+    quiz_msg_id = sent.id if sent else None
+    if not quiz_msg_id:
+        return
+    # 启动超时任务
+    timeout_task = asyncio.create_task(
+        _verification_timeout(client, user_id, msg.id, quiz_msg_id)
+    )
+    _pending_verifications[user_id] = {
+        "quiz_msg_id": quiz_msg_id,
+        "ad_msg_id": msg.id,
+        "answer": answer,
+        "expire_time": time.time() + AD_VERIFY_TIMEOUT,
+        "task": timeout_task,
+    }
+    logger.error("ad_verification_started user=%s answer=%s msg=%s", user_id, answer, msg.id)
+
+async def _verification_timeout(client, user_id: int, ad_msg_id: int, quiz_msg_id: int):
+    """超时未回答 → 删广告消息 + 踢出拉黑"""
+    await asyncio.sleep(AD_VERIFY_TIMEOUT)
+    info = _pending_verifications.pop(user_id, None)
+    if not info:
+        return  # 已被其他逻辑处理
+    logger.error("ad_verification_timeout user=%s", user_id)
+    try:
+        # 删除广告消息
+        await client.delete_messages(TARGET_CHAT_ID, ad_msg_id)
+    except Exception:
+        logger.exception("timeout_delete_ad_error")
+    try:
+        # 踢出并拉黑
+        participant = await client.get_input_entity(user_id)
+        channel = await client.get_input_entity(TARGET_CHAT_ID)
+        await client(functions.channels.EditBannedRequest(
+            channel=channel,
+            participant=participant,
+            banned_rights=types.ChatBannedRights(until_date=None, view_messages=True),
+        ))
+        # 删除该用户历史消息
+        await client(functions.channels.DeleteParticipantHistoryRequest(
+            channel=channel, participant=participant
+        ))
+    except Exception:
+        logger.exception("timeout_kick_error")
+    try:
+        # 更新验证消息
+        await client.edit_message(TARGET_CHAT_ID, quiz_msg_id,
+            "⛔ 验证超时，该用户已被踢出群组并拉黑。")
+        asyncio.create_task(delete_later(client, quiz_msg_id, 30))
+    except Exception:
+        logger.exception("timeout_edit_quiz_error")
+
+async def handle_verification_reply(client, msg):
+    """处理用户对验证消息的回复"""
+    user_id = msg.sender_id
+    if user_id not in _pending_verifications:
+        return False
+    info = _pending_verifications[user_id]
+    # 检查是否是回复验证消息
+    reply_to = getattr(msg, 'reply_to_msg_id', None)
+    if not reply_to:
+        # Telethon 有时 reply_to_msg_id 在 reply_to 对象里
+        reply_header = getattr(msg, 'reply_to', None)
+        if reply_header:
+            reply_to = getattr(reply_header, 'reply_to_msg_id', None)
+    if reply_to != info["quiz_msg_id"]:
+        return False
+    # 取消超时任务
+    info["task"].cancel()
+    _pending_verifications.pop(user_id, None)
+    raw = (msg.raw_text or "").strip()
+    try:
+        user_answer = int(raw)
+    except ValueError:
+        user_answer = None
+    try:
+        user = await msg.get_sender()
+    except Exception:
+        user = None
+    target_name = display_name_from_user(user)
+    if user_answer == info["answer"]:
+        # 答对 → 解除嫌疑
+        logger.error("ad_verification_passed user=%s", user_id)
+        try:
+            await client.edit_message(TARGET_CHAT_ID, info["quiz_msg_id"],
+                f"✅ {target_name} 验证通过，嫌疑已解除。")
+            asyncio.create_task(delete_later(client, info["quiz_msg_id"], 30))
+            asyncio.create_task(delete_later(client, msg.id, 10))
+        except Exception:
+            logger.exception("verification_pass_edit_error")
+    else:
+        # 答错 → 删广告消息 + 踢出拉黑
+        logger.error("ad_verification_failed user=%s answer=%s expected=%s", user_id, raw, info["answer"])
+        try:
+            await client.delete_messages(TARGET_CHAT_ID, info["ad_msg_id"])
+        except Exception:
+            logger.exception("wrong_answer_delete_ad_error")
+        try:
+            participant = await client.get_input_entity(user_id)
+            channel = await client.get_input_entity(TARGET_CHAT_ID)
+            await client(functions.channels.EditBannedRequest(
+                channel=channel,
+                participant=participant,
+                banned_rights=types.ChatBannedRights(until_date=None, view_messages=True),
+            ))
+            await client(functions.channels.DeleteParticipantHistoryRequest(
+                channel=channel, participant=participant
+            ))
+        except Exception:
+            logger.exception("wrong_answer_kick_error")
+        try:
+            await client.edit_message(TARGET_CHAT_ID, info["quiz_msg_id"],
+                f"⛔ {target_name} 回答错误，已被踢出群组并拉黑。")
+            asyncio.create_task(delete_later(client, info["quiz_msg_id"], 30))
+            asyncio.create_task(delete_later(client, msg.id, 10))
+        except Exception:
+            logger.exception("wrong_answer_edit_error")
+    return True
+
+async def check_message_for_ad(client, msg):
+    """对低活跃用户的消息做广告检测"""
+    if not AD_CHECK_ENABLED:
+        return
+    if not user_id:
+        return
+    # 预热期内只记录不检测
+    if time.time() - _boot_time < AD_WARMUP_SECONDS:
+        return
+    # 管理员和控制用户跳过
+    if user_id in CONTROL_USER_IDS:
+        return
+    # 正在验证中的用户跳过新消息检测
+    if user_id in _pending_verifications:
+        return
+    text = (msg.raw_text or "").strip()
+    if not text or len(text) < 4:
+        return
+    # 判断是否低活跃
+    if not is_low_activity(user_id):
+        return
+    # 调 AI 判断
+    loop = asyncio.get_event_loop()
+    is_ad = await loop.run_in_executor(None, ai_check_ad, text)
+    if is_ad:
+        logger.error("ad_detected user=%s text=%r", user_id, text[:100])
+        await start_ad_verification(client, msg)
+
+async def periodic_stats_cleanup():
+    """定时清理旧统计数据"""
+    while True:
+        try:
+            await asyncio.sleep(86400)  # 每24小时
+            cleanup_old_stats()
+            logger.error("stats_cleanup_done")
+        except Exception:
+            logger.exception("stats_cleanup_error")
+
+# ══════════════════════════════════════════════════
 
 PRAISE_TEMPLATES = [
     "{name}今天的表现太亮眼了，节奏稳、反应快，真的让人忍不住点赞。",
@@ -520,7 +852,10 @@ async def main():
     me = await client.get_me()
     me_id = getattr(me, "id", None)
 
-    logger.error("tg-auto-heart started in polling mode random 1-5s")
+    logger.error("tg-auto-heart started in polling mode random 1-5s (ad-detect enabled)")
+
+    # 启动定时清理任务
+    asyncio.create_task(periodic_stats_cleanup())
 
     processed_ids = set()
 
@@ -537,10 +872,24 @@ async def main():
                     continue
                 if msg.sender_id == me_id:
                     continue
-                if msg.sender_id not in CONTROL_USER_IDS:
-                    continue
                 processed_ids.add(mid)
-                asyncio.create_task(handle_control_command(client, msg))
+
+                # 1. 记录发言计数（所有用户）
+                if msg.sender_id:
+                    record_message(msg.sender_id)
+
+                # 2. 检查是否是验证回复
+                handled = await handle_verification_reply(client, msg)
+                if handled:
+                    continue
+
+                # 3. 管理员控制命令
+                if msg.sender_id in CONTROL_USER_IDS:
+                    asyncio.create_task(handle_control_command(client, msg))
+                    continue
+
+                # 4. 广告检测（低活跃用户）
+                asyncio.create_task(check_message_for_ad(client, msg))
 
             if len(processed_ids) > 5000:
                 processed_ids = set(sorted(processed_ids)[-2000:])

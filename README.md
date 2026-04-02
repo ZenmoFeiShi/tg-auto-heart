@@ -1,6 +1,6 @@
 # 🤖 tg-auto-heart
 
-一个基于 [Telethon](https://github.com/LonamiWebs/Telethon) 的 Telegram 群组管理机器人，支持禁言、踢人、解禁、AI 总结、随机夸人等功能，以 systemd 服务方式常驻运行。
+一个基于 [Telethon](https://github.com/LonamiWebs/Telethon) 的 Telegram 群组管理机器人，支持禁言、踢人、解禁、AI 总结、随机夸人、广告检测与答题验证等功能，以 systemd 服务方式常驻运行。
 
 ---
 
@@ -15,6 +15,7 @@
 | `解除拉黑` | 同解禁，解除封禁状态 |
 | `真棒` | 随机发送一条夸奖语给被回复用户 |
 | `总结最近 N 条` | 调用 AI 对最近 N 条消息进行总结 |
+| 广告检测与答题验证 | 可对低活跃用户消息进行 AI 广告识别，并触发限时答题验证 |
 | `状态` | 查询机器人运行状态 |
 | `用户ID/用户名 + 指令` | 不回复消息时，直接指定目标用户 ID 或 @用户名执行指令 |
 
