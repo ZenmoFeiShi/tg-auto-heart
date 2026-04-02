@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram Auto Heart Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tg-auto-heart
+ExecStart=/opt/tg-auto-heart/.venv/bin/python /opt/tg-auto-heart/tg_auto_heart.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
